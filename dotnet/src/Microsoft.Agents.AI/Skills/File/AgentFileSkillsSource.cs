@@ -328,7 +328,8 @@ public sealed partial class AgentFileSkillsSource : AgentSkillsSource
         }
 
         if (!AgentSkillFrontmatter.ValidateName(name, out string? validationReason) ||
-            !AgentSkillFrontmatter.ValidateDescription(description, out validationReason))
+            !AgentSkillFrontmatter.ValidateDescription(description, out validationReason) ||
+            !AgentSkillFrontmatter.ValidateCompatibility(compatibility, out validationReason))
         {
             LogInvalidFieldValue(this._logger, skillFilePath, "frontmatter", validationReason);
             return false;
@@ -637,9 +638,14 @@ public sealed partial class AgentFileSkillsSource : AgentSkillsSource
     {
         string value = kvMatch.Groups[3].Value;
 
-        if (value.Length == 0 || value[0] is not ('|' or '>'))
+        if (value.Length == 0 || value[0] is '"' or '\'' || IsCollectionEntry(value))
         {
             return value;
+        }
+
+        if (value[0] is not ('|' or '>'))
+        {
+            return ParsePlainScalarValue(yamlContent, kvMatch.Groups[3]);
         }
 
         char scalarStyle = value[0];
@@ -691,6 +697,55 @@ public sealed partial class AgentFileSkillsSource : AgentSkillsSource
             : string.Join(" ", normalizedLines.Where(line => line.Length > 0));
 
         return keepTrailingNewline ? parsedValue + "\n" : parsedValue;
+    }
+
+    /// <summary>
+    /// Returns whether a value looks like a sequence entry or a nested mapping rather than a plain
+    /// scalar. Such values keep their first line instead of having the collection folded into one string.
+    /// </summary>
+    private static bool IsCollectionEntry(string value) =>
+        value == "-" ||
+        value.StartsWith("- ", StringComparison.Ordinal) ||
+        value.EndsWith(":", StringComparison.Ordinal) ||
+        value.IndexOf(": ", StringComparison.Ordinal) >= 0;
+
+    /// <summary>
+    /// Returns a plain scalar value with its indented continuation lines folded as YAML does:
+    /// a single line break becomes a space and each blank line becomes a newline.
+    /// </summary>
+    private static string ParsePlainScalarValue(string yamlContent, Group valueGroup)
+    {
+        int lineEnd = yamlContent.IndexOf('\n', valueGroup.Index + valueGroup.Length);
+        if (lineEnd < 0)
+        {
+            return valueGroup.Value;
+        }
+
+        var builder = new StringBuilder(valueGroup.Value);
+        int pendingBlankLines = 0;
+        using var reader = new StringReader(yamlContent.Substring(lineEnd + 1));
+
+        string? line;
+        while ((line = reader.ReadLine()) is not null)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                pendingBlankLines++;
+                continue;
+            }
+
+            string trimmed = line.Trim();
+            if (line[0] is not (' ' or '\t') || trimmed[0] == '#')
+            {
+                break;
+            }
+
+            builder.Append(pendingBlankLines == 0 ? " " : new string('\n', pendingBlankLines));
+            builder.Append(trimmed);
+            pendingBlankLines = 0;
+        }
+
+        return builder.ToString();
     }
 
     /// <summary>

@@ -64,6 +64,7 @@ public sealed class FileAgentSkillLoaderTests : IDisposable
                 ("\"| not a block\"", "| not a block"),
                 ("\n  Read files", "Read files"),
                 ("\n\n  'Read files'", "Read files"),
+                ("'Read\n  files'", "'Read"),
                 ("\n  >-\n    Read\n    files", "Read files"),
                 ("|\n  Read\n  files", "Read\nfiles"),
                 ("|-\n  Read\n  files", "Read\nfiles"),
@@ -90,6 +91,37 @@ public sealed class FileAgentSkillLoaderTests : IDisposable
                         }
                     }
                 }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// Plain scalars whose value continues on indented lines, with LF and CRLF.
+    /// </summary>
+    public static TheoryData<string, string, string> MultilinePlainScalarFormats
+    {
+        get
+        {
+            var data = new TheoryData<string, string, string>();
+            (string Value, string Expected)[] cases =
+            [
+                (
+                    "Summarize a meeting transcript into decisions and action\n  items. Use when asked.",
+                    "Summarize a meeting transcript into decisions and action items. Use when asked."
+                ),
+                ("\n  Summarize a transcript.\n  Use when asked.", "Summarize a transcript. Use when asked."),
+                ("First line\n    deeper\n  last", "First line deeper last"),
+                ("First paragraph\n\n  Second paragraph", "First paragraph\nSecond paragraph"),
+                ("First paragraph\n\n\n  Second paragraph", "First paragraph\n\nSecond paragraph"),
+                ("First paragraph  \n\n  Second paragraph", "First paragraph\nSecond paragraph"),
+                ("Read files\n  # not part of the description", "Read files"),
+            ];
+            foreach (var (value, expected) in cases)
+            {
+                data.Add(value, expected, "\n");
+                data.Add(value, expected, "\r\n");
             }
 
             return data;
@@ -555,6 +587,60 @@ public sealed class FileAgentSkillLoaderTests : IDisposable
         // Assert
         Assert.Single(skills);
         Assert.Equal("This is a multiline description for the skill.", skills[0].Frontmatter.Description);
+    }
+
+    [Theory]
+    [MemberData(nameof(MultilinePlainScalarFormats))]
+    public async Task GetSkillsAsync_MultilinePlainDescription_FoldsContinuationLinesAsync(string value, string expected, string newline)
+    {
+        // Arrange
+        string content = $"---\nname: test-skill\ndescription: {value}\nlicense: MIT\n---\nBody.";
+        _ = this.CreateSkillDirectoryWithRawContent("test-skill", content.Replace("\n", newline));
+        var source = new AgentFileSkillsSource(this._testRoot, s_noOpExecutor);
+
+        // Act
+        var skills = await source.GetSkillsAsync(TestAgentSkillsSourceContextFactory.Create());
+
+        // Assert
+        var frontmatter = Assert.Single(skills).Frontmatter;
+        Assert.Equal(expected, frontmatter.Description);
+        Assert.Equal("MIT", frontmatter.License);
+    }
+
+    [Fact]
+    public async Task GetSkillsAsync_MultilinePlainDescriptionAsLastField_FoldsContinuationLinesAsync()
+    {
+        // Arrange
+        const string Content = "---\nname: test-skill\ndescription: Read\n  files\n---\nBody.";
+        _ = this.CreateSkillDirectoryWithRawContent("test-skill", Content);
+        var source = new AgentFileSkillsSource(this._testRoot, s_noOpExecutor);
+
+        // Act
+        var skills = await source.GetSkillsAsync(TestAgentSkillsSourceContextFactory.Create());
+
+        // Assert
+        Assert.Equal("Read files", Assert.Single(skills).Frontmatter.Description);
+    }
+
+    [Theory]
+    [InlineData("allowed-tools", "Read\n  Write", "Read Write")]
+    [InlineData("compatibility", "Any\n  runtime", "Any runtime")]
+    [InlineData("allowed-tools", "\n  - Read\n  - Write", "- Read")]
+    [InlineData("compatibility", "\n  runtime: dotnet\n  os: linux", "runtime: dotnet")]
+    public async Task GetSkillsAsync_ContinuationUnderOtherField_FoldsOnlyPlainScalarsAsync(
+        string field, string value, string expected)
+    {
+        // Arrange - a sequence or mapping keeps its first line instead of being folded into one string.
+        string content = $"---\nname: test-skill\ndescription: Read files\n{field}: {value}\n---\nBody.";
+        _ = this.CreateSkillDirectoryWithRawContent("test-skill", content);
+        var source = new AgentFileSkillsSource(this._testRoot, s_noOpExecutor);
+
+        // Act
+        var skills = await source.GetSkillsAsync(TestAgentSkillsSourceContextFactory.Create());
+
+        // Assert
+        var frontmatter = Assert.Single(skills).Frontmatter;
+        Assert.Equal(expected, field == "allowed-tools" ? frontmatter.AllowedTools : frontmatter.Compatibility);
     }
 
     [Theory]
@@ -1367,6 +1453,26 @@ public sealed class FileAgentSkillLoaderTests : IDisposable
 
         // Assert
         Assert.Empty(skills);
+    }
+
+    [Fact]
+    public async Task GetSkillsAsync_CompatibilityExceedsMaxLength_ExcludesOnlyThatSkillAsync()
+    {
+        // Arrange - compatibility folded across lines to more than 500 characters
+        string longCompatibility = $"{new string('a', 300)}\n  {new string('b', 300)}";
+        _ = this.CreateSkillDirectoryWithRawContent(
+            "long-compatibility",
+            $"---\nname: long-compatibility\ndescription: A skill\ncompatibility: {longCompatibility}\n---\nBody.");
+        _ = this.CreateSkillDirectoryWithRawContent(
+            "valid-skill",
+            "---\nname: valid-skill\ndescription: A skill\n---\nBody.");
+        var source = new AgentFileSkillsSource(this._testRoot, s_noOpExecutor);
+
+        // Act
+        var skills = await source.GetSkillsAsync(TestAgentSkillsSourceContextFactory.Create());
+
+        // Assert
+        Assert.Equal("valid-skill", Assert.Single(skills).Frontmatter.Name);
     }
 
 #if NET
